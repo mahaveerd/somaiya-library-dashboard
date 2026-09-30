@@ -1,0 +1,43 @@
+name: Refresh dashboard data
+
+on:
+  workflow_dispatch:      # "Run workflow" button — team can refresh on demand
+  schedule:
+    - cron: '15 3-13 * * *'   # hourly 08:45–18:45 IST
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy reports to any newly-live instances (idempotent)
+        env:
+          KOHA_USER: ${{ secrets.KOHA_USER }}
+          KOHA_PASS: ${{ secrets.KOHA_PASS }}
+        run: cd pipeline && python3 deploy_reports.py || true
+
+      - name: Harvest KPI data and rebuild
+        env:
+          KOHA_USER: ${{ secrets.KOHA_USER }}
+          KOHA_PASS: ${{ secrets.KOHA_PASS }}
+          SITE_DIR: ${{ github.workspace }}
+        run: |
+          cd pipeline
+          python3 harvest.py
+          python3 build_dashboard.py
+
+      - name: Commit and push if data changed
+        run: |
+          git config user.name "dashboard-refresh-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data.json index.html
+          if git diff --cached --quiet; then
+            echo "no data changes"
+          else
+            git commit -m "Data refresh $(date -u '+%Y-%m-%d %H:%M UTC')" -m "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+            git push
+          fi

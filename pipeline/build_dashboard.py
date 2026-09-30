@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""Build dashboard.html (self-contained, interactive) from kpi.sqlite.
+
+Run after each harvest:  python3 build_dashboard.py
+Interactive: campus filter chips, metric switcher, time-range presets, theme
+toggle — all client-side, no server needed. Validated dataviz palette for
+series (slots 1-3 all-pairs safe); Somaiya maroon is UI chrome only.
+"""
+import json
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+HERE = Path(__file__).parent
+DB = HERE / "kpi.sqlite"
+OUT = HERE / "dashboard.html"
+
+# organisation hierarchy: every library belongs to an org (display order below)
+ORGS = {
+    "SVU": "Somaiya Vidyavihar University",
+    "SVV": "Somaiya Vidyavihar",
+}
+
+# fixed entity registry keyed by "instance:branchcode" — color follows the
+# entity, never rank/order-of-arrival. GCC ("Global") is the shared patron-pool
+# branch (no items) and is excluded. New go-lives: append here with next slot
+# and org code. Registry order = display order (grouped by org).
+ENTITIES = {
+    # — SVU: university constituent libraries —
+    "svu:kjsce":     ("KJS College of Engineering", "Engg", 1, "SVU"),
+    "sksac:SKSCASC": ("S.K. Somaiya College", "SKSAC", 3, "SVU"),
+    "svu:kjsim":     ("KJS Institute of Management", "KJSIM", 4, "SVU"),
+    "svu:AUBL":      ("Aurobindo & Bhaskaracharya", "AUBL", 5, "SVU"),
+    "svu:kjsids":    ("Institute of Dharma Studies", "IDS", 6, "SVU"),
+    "svu:kjscedu":   ("KJS School of Education", "Edu", 7, "SVU"),
+    "svu:SVVU":      ("SVVU Central Library", "SVVU", 8, "SVU"),
+    "svu:ssa":       ("Sports Academy", "SSA", 9, "SVU"),  # slot 9 = neutral gray (8-hue palette cap)
+    # — SVV: trust institutions (Mumbai University-affiliated / schools) —
+    "kjsit:KJSIT":   ("KJS Institute of Technology", "KJSIT", 2, "SVV"),
+    "ded:SSKSJCE":   ("SKS Junior College of Education", "DED", 10, "SVV"),  # live Sep 2026
+}
+SERIES_LIGHT = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#eda100",
+                5: "#e87ba4", 6: "#008300", 7: "#4a3aa7", 8: "#e34948", 9: "#898781"}
+SERIES_DARK = {1: "#3987e5", 2: "#d95926", 3: "#199e70", 4: "#c98500",
+               5: "#d55181", 6: "#008300", 7: "#9085e9", 8: "#e66767", 9: "#898781"}
+
+
+def q(con, sql):
+    cur = con.execute(sql)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def latest(con, table):
+    return q(con, f'''SELECT t.* FROM "{table}" t
+        JOIN (SELECT campus, MAX(fetched_at) mf FROM "{table}" GROUP BY campus) m
+          ON m.campus = t.campus AND m.mf = t.fetched_at''')
+
+
+def keyed(rows):
+    """Tag branch-level rows with entity key; drop GCC/unregistered branches."""
+    out = []
+    for r in rows:
+        k = f"{r['campus']}:{r['branch']}"
+        if k in ENTITIES:
+            out.append({**r, "key": k})
+    return out
+
+
+def main():
+    con = sqlite3.connect(DB)
+    snapshot = keyed(latest(con, "KPI_SNAPSHOT_BR"))
+    fetched = max((r["fetched_at"] for r in snapshot), default="")
+    # registry order defines display order; only entities present in data appear
+    present = [k for k in ENTITIES if any(r["key"] == k for r in snapshot)]
+
+    data = {
+        "generated": datetime.now().strftime("%d %b %Y, %H:%M"),
+        "fetched": fetched,
+        "orgs": [{"code": c, "name": n} for c, n in ORGS.items()],
+        "entities": [{"key": k, "name": ENTITIES[k][0], "short": ENTITIES[k][1],
+                      "slot": ENTITIES[k][2], "org": ENTITIES[k][3]} for k in present],
+        "snapshot": {r["key"]: r for r in snapshot},
+        "monthly": keyed(latest(con, "KPI_MONTHLY_CIRC_BR")),
+        "daily": keyed(latest(con, "KPI_DAILY_CIRC_BR")),
+        "topTitles": keyed(latest(con, "KPI_TOP_TITLES_MONTH_BR")),
+        "byCategory": keyed(latest(con, "KPI_CIRC_BY_CATEGORY_BR")),
+        "byItype": keyed(latest(con, "KPI_COLLECTION_BY_ITYPE_BR")),
+        "newItems": keyed(latest(con, "KPI_NEW_ITEMS_MONTHLY_BR")),
+        "seriesLight": SERIES_LIGHT,
+        "seriesDark": SERIES_DARK,
+    }
+    page = TEMPLATE.replace("__DATA__", json.dumps(data).replace("</", "<\\/"))
+    OUT.write_text(page)
+
+    # artifact variant: same page without the outer skeleton (artifact wraps it)
+    import re
+    style = re.search(r"<style>(.*?)</style>", page, re.S).group(1)
+    body = re.search(r"<body>(.*)</body>", page, re.S).group(1)
+    (HERE / "dashboard-artifact.html").write_text(
+        f"<title>Somaiya Libraries — KPI Dashboard</title>\n<style>{style}</style>\n{body}")
+
+    # site variant (GitHub Pages): static index.html + data.json fetched at load,
+    # so a refresh only pushes new data.json — the page itself rarely changes.
+    # SITE_DIR env overrides the output dir (used by the GitHub Actions refresh).
+    import os
+    site = Path(os.environ.get("SITE_DIR", HERE / "site"))
+    site.mkdir(exist_ok=True)
+    pages_html = TEMPLATE.replace("<script>", '<script type="module">', 1).replace(
+        "__DATA__", "await (await fetch('data.json?v=' + Date.now())).json()")
+    (site / "index.html").write_text(pages_html)
+    (site / "data.json").write_text(json.dumps(data))
+    print(f"built {OUT} (+ artifact & site variants) — {len(present)} libraries, harvest {fetched}")
+
+
+TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Somaiya Libraries — KPI Dashboard</title>
+<style>
+  :root {
+    color-scheme: light;
+    --brand: #990011;
+    --page: #f9f9f7; --surface: #fcfcfb;
+    --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,.10);
+    --chip: #f0efec;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19;
+    --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,.10);
+    --chip: #262624;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19;
+      --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,.10);
+      --chip: #262624;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--ink);
+         font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { background: var(--brand); color: #fff; padding: 18px 28px;
+           display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 20px; font-weight: 700; }
+  header .sub { color: #f3d2d5; font-size: 12.5px; margin-top: 3px; }
+  #themeBtn { background: rgba(255,255,255,.14); color: #fff; border: 1px solid rgba(255,255,255,.35);
+              border-radius: 8px; padding: 6px 12px; font-size: 12.5px; cursor: pointer; }
+  main { max-width: 1180px; margin: 0 auto; padding: 18px 20px 60px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center;
+              background: var(--surface); border: 1px solid var(--ring); border-radius: 10px;
+              padding: 10px 14px; margin-bottom: 18px; position: sticky; top: 8px; z-index: 5; }
+  .controls .grp { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .controls .lbl { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--ring);
+          background: var(--chip); color: var(--ink2); border-radius: 16px; padding: 4px 11px;
+          font-size: 12.5px; cursor: pointer; user-select: none; font-family: inherit; }
+  .chip i { width: 9px; height: 9px; border-radius: 3px; display: inline-block; }
+  .chip.on { background: var(--surface); color: var(--ink); border-color: var(--ink2); font-weight: 600; }
+  .chip.off i { opacity: .25; }
+  .seg { display: inline-flex; border: 1px solid var(--ring); border-radius: 8px; overflow: hidden; }
+  .seg button { background: var(--chip); color: var(--ink2); border: none; padding: 5px 11px;
+                font-size: 12.5px; cursor: pointer; }
+  .seg button.on { background: var(--brand); color: #fff; font-weight: 600; }
+  .libdd { position: relative; }
+  .dd-panel { position: absolute; top: calc(100% + 6px); left: 0; background: var(--surface);
+              border: 1px solid var(--ring); border-radius: 10px; box-shadow: 0 8px 28px rgba(0,0,0,.2);
+              padding: 10px 14px; min-width: 300px; z-index: 30; max-height: 350px; overflow-y: auto; }
+  .dd-org, .dd-lib { display: flex; gap: 8px; align-items: center; cursor: pointer; user-select: none; }
+  .dd-org { font-weight: 700; font-size: 12.5px; color: var(--ink); margin: 7px 0 3px; }
+  .dd-org:first-child { margin-top: 0; }
+  .dd-lib { font-size: 12.5px; color: var(--ink2); padding: 3px 0 3px 20px; }
+  .dd-lib:hover, .dd-org:hover { color: var(--brand-ink); }
+  .dd-panel input[type=checkbox] { accent-color: var(--brand); margin: 0; }
+  .dd-lib i { width: 9px; height: 9px; border-radius: 3px; display: inline-block; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap: 12px; margin-bottom: 20px; }
+  .tile { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 13px 16px; }
+  .tile .v { font-size: 26px; font-weight: 700; }
+  .tile .l { font-size: 12.5px; color: var(--ink2); margin-top: 2px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 16px 18px 12px; }
+  .card.wide { grid-column: 1 / -1; }
+  .card h2 { margin: 0 0 2px; font-size: 15px; }
+  .card .note { font-size: 12px; color: var(--muted); margin: 0 0 10px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: var(--ink2); margin: 6px 0 4px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  svg { width: 100%; height: auto; display: block; }
+  svg text { font-family: inherit; }
+  .axis-t { font-size: 11px; fill: var(--muted); }
+  .dl { font-size: 11.5px; font-weight: 600; }
+  details { margin: 8px 0 4px; }
+  summary { font-size: 12px; color: var(--muted); cursor: pointer; }
+  table { border-collapse: collapse; font-size: 12.5px; margin-top: 8px; width: 100%; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--grid); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .sparks { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px,1fr)); gap: 12px; }
+  .sparks .orghead { grid-column: 1 / -1; font-size: 12px; font-weight: 700; color: var(--muted);
+                     text-transform: uppercase; letter-spacing: .5px; margin: 6px 0 -4px; }
+  .spark { border: 1px solid var(--ring); border-radius: 9px; padding: 10px 12px 8px; background: var(--surface); }
+  .spark .nm { display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; color: var(--ink); }
+  .spark .nm i { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+  .spark .val { font-size: 21px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .spark .sub { font-size: 11px; color: var(--muted); }
+  .spark .delta-up { color: #0ca30c; font-weight: 600; }
+  .spark .delta-down { color: #d03b3b; font-weight: 600; }
+  .lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px,1fr)); gap: 14px; }
+  .lists h3 { font-size: 13px; margin: 4px 0 6px; display: flex; align-items: center; gap: 6px; }
+  .lists h3 i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  .lists ol { margin: 0; padding-left: 20px; font-size: 12.5px; color: var(--ink2); }
+  .lists li { margin: 3px 0; }
+  .lists .n { color: var(--ink); font-weight: 600; }
+  #tip { position: fixed; pointer-events: none; background: var(--surface); color: var(--ink);
+         border: 1px solid var(--ring); box-shadow: 0 2px 10px rgba(0,0,0,.18); border-radius: 7px;
+         padding: 6px 9px; font-size: 12px; display: none; z-index: 10; max-width: 260px; }
+  footer { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 26px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Somaiya Libraries — KPI Dashboard</h1>
+    <div class="sub" id="subtitle"></div>
+  </div>
+  <button id="themeBtn">◐ Theme: Auto</button>
+</header>
+<main>
+  <div class="controls" id="controls"></div>
+  <div class="tiles" id="tiles"></div>
+  <div class="grid" id="grid"></div>
+</main>
+<div id="tip"></div>
+<footer id="foot"></footer>
+<script>
+const D = __DATA__;
+const ALL = D.entities.map(c => c.key);
+const state = { sel: new Set(ALL), metric: 'checkouts', months: 13, days: 30, theme: 'auto' };
+
+const isDark = () => {
+  if (state.theme === 'dark') return true;
+  if (state.theme === 'light') return false;
+  return matchMedia('(prefers-color-scheme: dark)').matches;
+};
+let SER = {};
+const refreshSer = () => { SER = isDark() ? D.seriesDark : D.seriesLight; };
+const camp = k => D.entities.find(c => c.key === k);
+const color = k => SER[camp(k).slot] || '#898781';  // slots past the 8-hue palette render neutral gray
+const nameOf = k => camp(k).name;
+const shortOf = k => camp(k).short;
+const fmt = n => Number(n).toLocaleString('en-IN');
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const sel = () => ALL.filter(s => state.sel.has(s));
+
+document.getElementById('subtitle').textContent =
+  `${ALL.length} libraries live on Koha · data harvested ${D.fetched.replace('T',' ').replace('+00:00',' UTC')}`;
+document.getElementById('foot').textContent =
+  `Generated ${D.generated} · aggregates only, no patron-level data · member counts are branch-registered; the shared "Global" pool (~37k campus-wide accounts) is excluded · more libraries appear as they go live`;
+
+/* ---------- theme toggle ---------- */
+const themeBtn = document.getElementById('themeBtn');
+themeBtn.onclick = () => {
+  state.theme = state.theme === 'auto' ? 'light' : state.theme === 'light' ? 'dark' : 'auto';
+  if (state.theme === 'auto') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', state.theme);
+  themeBtn.textContent = '◐ Theme: ' + state.theme[0].toUpperCase() + state.theme.slice(1);
+  render();
+};
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (state.theme === 'auto') render(); });
+
+/* ---------- controls ---------- */
+const orgName = code => D.orgs.find(o => o.code === code).name;
+const orgLibs = code => ALL.filter(k => camp(k).org === code);
+const setEq = (set, arr) => set.size === arr.length && arr.every(k => set.has(k));
+
+document.addEventListener('click', e => {
+  if (state.panelOpen && !e.target.closest('.libdd')) { state.panelOpen = false; render(); }
+});
+
+function buildControls() {
+  const c = document.getElementById('controls');
+  c.innerHTML = '';
+
+  // view switcher: All | SVU | SVV (custom selections highlight nothing)
+  const g0 = document.createElement('div'); g0.className = 'grp';
+  g0.innerHTML = '<span class="lbl">View</span>';
+  const seg0 = document.createElement('span'); seg0.className = 'seg';
+  const views = [['All', ALL], ...D.orgs.map(o => [o.code, orgLibs(o.code)]).filter(v => v[1].length)];
+  views.forEach(([label, libs]) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    if (setEq(state.sel, libs)) b.className = 'on';
+    b.title = label === 'All' ? 'All libraries' : orgName(label);
+    b.onclick = () => { state.sel = new Set(libs); render(); };
+    seg0.appendChild(b);
+  });
+  g0.appendChild(seg0);
+
+  // compact library picker dropdown, grouped by org
+  const dd = document.createElement('div'); dd.className = 'libdd';
+  const btn = document.createElement('button');
+  btn.type = 'button'; btn.className = 'chip on';
+  btn.innerHTML = `Libraries: ${state.sel.size}/${ALL.length} <span style="font-size:10px">▾</span>`;
+  btn.onclick = () => { state.panelOpen = !state.panelOpen; render(); };
+  dd.appendChild(btn);
+  if (state.panelOpen) {
+    const panel = document.createElement('div'); panel.className = 'dd-panel';
+    D.orgs.forEach(o => {
+      const libs = orgLibs(o.code);
+      if (!libs.length) return;
+      const allOn = libs.every(k => state.sel.has(k));
+      const orgRow = document.createElement('label'); orgRow.className = 'dd-org';
+      orgRow.innerHTML = `<input type="checkbox" ${allOn ? 'checked' : ''}> ${o.code} — ${o.name}`;
+      orgRow.querySelector('input').onchange = () => {
+        if (allOn) { libs.forEach(k => state.sel.delete(k)); if (!state.sel.size) state.sel.add(libs[0]); }
+        else libs.forEach(k => state.sel.add(k));
+        render();
+      };
+      panel.appendChild(orgRow);
+      libs.forEach(s => {
+        const row = document.createElement('label'); row.className = 'dd-lib';
+        row.innerHTML = `<input type="checkbox" ${state.sel.has(s) ? 'checked' : ''}>
+                         <i style="background:${color(s)}"></i> ${nameOf(s)}`;
+        row.querySelector('input').onchange = () => {
+          if (state.sel.has(s)) { if (state.sel.size > 1) state.sel.delete(s); }
+          else state.sel.add(s);
+          render();
+        };
+        panel.appendChild(row);
+      });
+    });
+    dd.appendChild(panel);
+  }
+  g0.appendChild(dd);
+  c.appendChild(g0);
+
+  const segs = [
+    ['Metric', 'metric', [['checkouts','Checkouts'], ['returns','Returns'], ['renewals','Renewals']]],
+    ['Trend', 'months', [[6,'6 mo'], [13,'13 mo']]],
+    ['Daily', 'days', [[7,'7 d'], [14,'14 d'], [30,'30 d']]],
+  ];
+  segs.forEach(([label, key, opts]) => {
+    const g = document.createElement('div'); g.className = 'grp';
+    g.innerHTML = `<span class="lbl">${label}</span>`;
+    const seg = document.createElement('span'); seg.className = 'seg';
+    opts.forEach(([v, t]) => {
+      const b = document.createElement('button');
+      b.textContent = t;
+      if (state[key] === v) b.className = 'on';
+      b.onclick = () => { state[key] = v; render(); };
+      seg.appendChild(b);
+    });
+    g.appendChild(seg);
+    c.appendChild(g);
+  });
+}
+
+/* ---------- shared helpers ---------- */
+const tip = document.getElementById('tip');
+function bindTips(root) {
+  root.querySelectorAll('[data-tip]').forEach(el => {
+    el.addEventListener('mousemove', e => {
+      tip.innerHTML = el.getAttribute('data-tip');
+      tip.style.display = 'block';
+      tip.style.left = Math.min(e.clientX + 14, innerWidth - 250) + 'px';
+      tip.style.top = (e.clientY + 14) + 'px';
+    });
+    el.addEventListener('mouseleave', () => tip.style.display = 'none');
+  });
+}
+function card(title, note, wide) {
+  const c = document.createElement('div');
+  c.className = 'card' + (wide ? ' wide' : '');
+  c.innerHTML = `<h2>${title}</h2><p class="note">${note}</p>`;
+  return c;
+}
+function legend(slugs) {
+  const l = document.createElement('div'); l.className = 'legend';
+  slugs.forEach(s => l.innerHTML += `<span><i style="background:${color(s)}"></i>${nameOf(s)}</span>`);
+  return l;
+}
+function dataTable(headers, rows) {
+  const d = document.createElement('details');
+  d.innerHTML = `<summary>View data</summary><table><tr>${headers.map((h,i) =>
+    `<th class="${i ? 'num' : ''}">${h}</th>`).join('')}</tr>${rows.map(r =>
+    `<tr>${r.map((v,i) => `<td class="${i ? 'num' : ''}">${esc(v)}</td>`).join('')}</tr>`).join('')}</table>`;
+  return d;
+}
+
+function lineChart(rows, xKey, yKey, slugs, xLabels, opts = {}) {
+  const allTicks = !!opts.allTicks, valueLabels = !!opts.valueLabels;
+  const W = 560, H = allTicks ? 258 : 240, mL = 44, mR = 78, mT = valueLabels ? 20 : 12,
+        mB = allTicks ? 44 : 26;
+  const xs = xLabels;
+  const inPlay = rows.filter(r => slugs.includes(r.key) && xs.includes(r[xKey]));
+  const maxY = Math.max(1, ...inPlay.map(r => Number(r[yKey] || 0)));
+  const x = i => mL + (xs.length < 2 ? 0 : i * (W - mL - mR) / (xs.length - 1));
+  const y = v => mT + (H - mT - mB) * (1 - v / maxY);
+  let g = '';
+  for (let t = 0; t <= 4; t++) {
+    const v = maxY * t / 4, yy = y(v);
+    g += `<line x1="${mL}" x2="${W - mR}" y1="${yy}" y2="${yy}" stroke="var(--grid)" stroke-width="1"/>`;
+    g += `<text x="${mL - 6}" y="${yy + 3.5}" text-anchor="end" class="axis-t">${fmt(Math.round(v))}</text>`;
+  }
+  if (allTicks) {
+    // every label, angled so they all fit
+    const fs = xs.length > 20 ? 8.5 : 10;
+    xs.forEach((lb, i) => {
+      const xx = x(i), yy = H - mB + 12;
+      g += `<text x="${xx}" y="${yy}" text-anchor="end" class="axis-t" font-size="${fs}" transform="rotate(-45 ${xx} ${yy})">${lb}</text>`;
+    });
+  } else {
+    const step = Math.max(1, Math.ceil(xs.length / 7));
+    xs.forEach((lb, i) => {
+      if (i % step === 0)
+        g += `<text x="${x(i)}" y="${H - 8}" text-anchor="middle" class="axis-t">${lb}</text>`;
+    });
+  }
+  g += `<line x1="${mL}" x2="${W - mR}" y1="${y(0)}" y2="${y(0)}" stroke="var(--axis)" stroke-width="1"/>`;
+  const endLabels = [], valLabels = [];
+  slugs.forEach(slug => {
+    const pts = xs.map((lb, i) => {
+      const row = rows.find(r => r.key === slug && r[xKey] === lb);
+      return [i, row ? Number(row[yKey] || 0) : null];
+    });
+    const path = pts.filter(p => p[1] !== null)
+      .map((p, j) => (j ? 'L' : 'M') + x(p[0]).toFixed(1) + ' ' + y(p[1]).toFixed(1)).join(' ');
+    g += `<path d="${path}" fill="none" stroke="${color(slug)}" stroke-width="2" stroke-linejoin="round"/>`;
+    const last = [...pts].reverse().find(p => p[1] !== null);
+    if (last) endLabels.push({ slug, x: x(last[0]) + 6, y: y(last[1]) + 4 });
+    pts.forEach(p => {
+      if (p[1] === null) return;
+      g += `<circle cx="${x(p[0])}" cy="${y(p[1])}" r="9" fill="transparent" data-tip="<b>${nameOf(slug)}</b><br>${xs[p[0]]}: ${fmt(p[1])}"/>` +
+           `<circle cx="${x(p[0])}" cy="${y(p[1])}" r="2.5" fill="${color(slug)}" pointer-events="none"/>`;
+      if (valueLabels && p[1] !== 0) valLabels.push({ slug, xi: p[0], x: x(p[0]), y: y(p[1]), v: p[1] });
+    });
+  });
+  if (valueLabels) {
+    // de-overlap figures sharing the same x; keep at most the 4 largest per x
+    // and never let the stack spill past the baseline into the tick labels
+    const fs = xs.length > 20 ? 8 : 9.5;
+    const floorY = y(0) - 4, ceilY = 9;
+    const byX = {};
+    valLabels.forEach(l => (byX[l.xi] = byX[l.xi] || []).push(l));
+    const kept = [];
+    Object.values(byX).forEach(group => {
+      group.sort((a, b) => b.v - a.v);
+      group = group.slice(0, 4);
+      group.sort((a, b) => a.y - b.y);
+      let prev = -Infinity;
+      group.forEach(l => {
+        l.ly = Math.max(l.y - 6, prev + 10);
+        prev = l.ly;
+      });
+      // pull back up if the stack crossed the baseline
+      for (let i = group.length - 1; i >= 0; i--) {
+        const maxY = i === group.length - 1 ? floorY : group[i + 1].ly - 10;
+        if (group[i].ly > maxY) group[i].ly = maxY;
+      }
+      group.forEach(l => { if (l.ly >= ceilY) kept.push(l); });
+    });
+    kept.forEach(l => {
+      g += `<text x="${l.x}" y="${l.ly}" text-anchor="middle" font-size="${fs}" font-weight="600"
+              fill="${color(l.slug)}" stroke="var(--surface)" stroke-width="3" paint-order="stroke">${fmt(l.v)}</text>`;
+    });
+  }
+  // series name labels at line ends: spread apart, then pull back inside the plot
+  endLabels.sort((a, b) => a.y - b.y);
+  for (let i = 1; i < endLabels.length; i++)
+    if (endLabels[i].y - endLabels[i - 1].y < 13) endLabels[i].y = endLabels[i - 1].y + 13;
+  for (let i = endLabels.length - 1; i >= 0; i--) {
+    const maxY = i === endLabels.length - 1 ? H - mB - 2 : endLabels[i + 1].y - 13;
+    if (endLabels[i].y > maxY) endLabels[i].y = maxY;
+    if (endLabels[i].y < mT + 8) endLabels[i].y = mT + 8;
+  }
+  endLabels.forEach(l => {
+    g += `<text x="${l.x}" y="${l.y}" class="dl" fill="${color(l.slug)}">${shortOf(l.slug)}</text>`;
+  });
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.innerHTML = g;
+  return svg;
+}
+
+function hBars(rows, opts = {}) {
+  // rows: {label, parts:[{v,color,tip}]} for bars, or {heading} for group headers
+  const W = 560, rowH = 30, headH = 26, mL = opts.labelW || 150, mR = 60, mT = 4;
+  const H = mT + rows.reduce((a, r) => a + (r.heading ? headH : rowH), 0) + 6;
+  const bars = rows.filter(r => !r.heading);
+  const maxV = Math.max(1, ...bars.map(r => r.parts.reduce((a, p) => a + p.v, 0)));
+  const x = v => mL + v * (W - mL - mR) / maxV;
+  let g = '', yy = mT;
+  rows.forEach(r => {
+    if (r.heading) {
+      g += `<text x="0" y="${yy + 17}" class="dl" fill="var(--ink)" font-size="12.5">${esc(r.heading)}</text>`;
+      yy += headH;
+      return;
+    }
+    const by = yy + 5;
+    g += `<text x="${mL - 8}" y="${by + 12}" text-anchor="end" class="axis-t" fill="var(--ink2)">${esc(r.label)}</text>`;
+    let acc = 0;
+    r.parts.forEach((p, pi) => {
+      const x0 = x(acc), x1 = x(acc + p.v);
+      const wpx = Math.max(0, x1 - x0 - 2);
+      const rx = pi === r.parts.length - 1 ? 4 : 0;
+      g += `<rect x="${x0}" y="${by}" width="${wpx}" height="16" rx="${rx}" fill="${p.color}" data-tip="${p.tip}"/>`;
+      acc += p.v;
+    });
+    g += `<text x="${x(acc) + 6}" y="${by + 12}" class="dl" fill="var(--ink2)">${fmt(acc)}</text>`;
+    yy += rowH;
+  });
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.innerHTML = g;
+  return svg;
+}
+
+/* group per-library bar rows by organisation with subtotal headings */
+function orgGrouped(slugs, makeRow, subtotalOf) {
+  const rows = [];
+  D.orgs.forEach(o => {
+    const libs = slugs.filter(k => camp(k).org === o.code);
+    if (!libs.length) return;
+    const subtotal = libs.reduce((a, k) => a + subtotalOf(k), 0);
+    rows.push({ heading: `${o.code} · ${orgName(o.code)} — ${fmt(subtotal)}` });
+    libs.forEach(k => rows.push(makeRow(k)));
+  });
+  return rows;
+}
+
+/* small-multiples grid: one mini trend panel per library, grouped by org */
+function sparkGrid(rows, xKey, yKey, slugs, xLabels) {
+  const wrap = document.createElement('div'); wrap.className = 'sparks';
+  const seriesOf = keys => xLabels.map(lb => keys.reduce((a, k) => {
+    const r = rows.find(x => x.key === k && x[xKey] === lb);
+    return a + (r ? Number(r[yKey] || 0) : 0);
+  }, 0));
+
+  function panel(label, dotColor, vals, lineColor) {
+    const W = 190, H = 46;
+    const maxV = Math.max(1, ...vals);
+    const x = i => vals.length < 2 ? 0 : i * W / (vals.length - 1);
+    const y = v => 4 + (H - 8) * (1 - v / maxV);
+    const pts = vals.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`);
+    const last = vals[vals.length - 1], prev = vals[vals.length - 2] ?? 0;
+    const delta = prev === 0 ? (last > 0 ? '▲ new' : '') :
+      (last >= prev ? '▲ ' : '▼ ') + Math.abs(Math.round(100 * (last - prev) / prev)) + '%';
+    const dcls = last >= prev ? 'delta-up' : 'delta-down';
+    const total = vals.reduce((a, b) => a + b, 0);
+    const d = document.createElement('div'); d.className = 'spark';
+    d.innerHTML = `
+      <div class="nm">${dotColor ? `<i style="background:${dotColor}"></i>` : ''}${esc(label)}</div>
+      <div class="val">${fmt(last)} <span class="sub ${delta ? dcls : ''}">${delta}</span></div>
+      <div class="sub">${esc(xLabels[xLabels.length - 1])} · ${fmt(total)} total in range</div>
+      <svg viewBox="0 0 ${W} ${H}" style="margin-top:6px">
+        <polygon points="0,${H} ${pts.join(' ')} ${W},${H}" fill="${lineColor}" opacity="0.12"/>
+        <polyline points="${pts.join(' ')}" fill="none" stroke="${lineColor}" stroke-width="2" stroke-linejoin="round"/>
+        <circle cx="${x(vals.length - 1)}" cy="${y(last)}" r="3" fill="${lineColor}"/>
+        ${vals.map((v, i) => `<circle cx="${x(i)}" cy="${y(v)}" r="8" fill="transparent" data-tip="<b>${esc(label)}</b><br>${esc(xLabels[i])}: ${fmt(v)}"/>`).join('')}
+      </svg>`;
+    return d;
+  }
+
+  wrap.appendChild(panel('All selected libraries', null, seriesOf(slugs), 'var(--ink2)'));
+  D.orgs.forEach(o => {
+    const libs = slugs.filter(k => camp(k).org === o.code);
+    if (!libs.length) return;
+    const oh = document.createElement('div'); oh.className = 'orghead';
+    oh.textContent = `${o.code} — ${orgName(o.code)}`;
+    wrap.appendChild(oh);
+    libs.forEach(k => wrap.appendChild(panel(nameOf(k), color(k), seriesOf([k]), color(k))));
+  });
+  return wrap;
+}
+
+/* ---------- render ---------- */
+function render() {
+  refreshSer();
+  buildControls();
+  const slugs = sel();
+  const M = state.metric;
+  const Mlabel = M[0].toUpperCase() + M.slice(1);
+
+  /* tiles */
+  const tiles = document.getElementById('tiles');
+  tiles.innerHTML = '';
+  const rows = slugs.map(s => D.snapshot[s]);
+  const sum = k => rows.reduce((a, r) => a + Number(r[k] || 0), 0);
+  [['Titles', fmt(sum('titles'))], ['Copies', fmt(sum('copies'))],
+   ['Active members (90d)', fmt(sum('active_members_90d'))],
+   ['Checkouts out now', fmt(sum('current_checkouts'))],
+   ['Overdue now', fmt(sum('overdue_now'))],
+   ['Fines outstanding', '₹' + fmt(sum('fines_outstanding'))]]
+  .forEach(([l, v]) => {
+    const t = document.createElement('div'); t.className = 'tile';
+    t.innerHTML = `<div class="v">${v}</div><div class="l">${l}</div>`;
+    tiles.appendChild(t);
+  });
+
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+
+  /* by organisation */
+  {
+    const c = card('By organisation', 'Subtotals for the selected libraries, grouped by the Somaiya org structure', true);
+    const cols = [['titles','Titles'], ['copies','Copies'], ['members','Members'],
+                  ['active_members_90d','Active (90d)'], ['current_checkouts','Out now'],
+                  ['overdue_now','Overdue'], ['fines_outstanding','Fines ₹']];
+    const rowsHtml = [];
+    D.orgs.forEach(o => {
+      const libs = slugs.filter(k => camp(k).org === o.code);
+      if (!libs.length) return;
+      const sums = cols.map(([k]) => libs.reduce((a, s) => a + Number(D.snapshot[s][k] || 0), 0));
+      rowsHtml.push(`<tr><td><b>${o.code}</b> — ${orgName(o.code)} <span style="color:var(--muted)">(${libs.length} librar${libs.length > 1 ? 'ies' : 'y'})</span></td>${sums.map(v => `<td class="num"><b>${fmt(v)}</b></td>`).join('')}</tr>`);
+      libs.forEach(s => {
+        rowsHtml.push(`<tr><td style="padding-left:26px"><span style="display:inline-block;width:9px;height:9px;border-radius:3px;background:${color(s)};margin-right:6px"></span>${nameOf(s)}</td>${cols.map(([k]) => `<td class="num">${fmt(D.snapshot[s][k] || 0)}</td>`).join('')}</tr>`);
+      });
+    });
+    const totals = cols.map(([k]) => slugs.reduce((a, s) => a + Number(D.snapshot[s][k] || 0), 0));
+    rowsHtml.push(`<tr><td><b>All selected libraries</b></td>${totals.map(v => `<td class="num"><b>${fmt(v)}</b></td>`).join('')}</tr>`);
+    const t = document.createElement('div');
+    t.style.overflowX = 'auto';
+    t.innerHTML = `<table><tr><th>Organisation / Library</th>${cols.map(([, l]) => `<th class="num">${l}</th>`).join('')}</tr>${rowsHtml.join('')}</table>`;
+    c.appendChild(t);
+    grid.appendChild(c);
+  }
+
+  /* monthly trend — small multiples, one panel per library */
+  {
+    const months = [...new Set(D.monthly.map(r => r.month))].sort().slice(-state.months);
+    const c = card(`Monthly ${M} by library`,
+      `Last ${state.months} months — latest month, change vs previous, and trend per library`, true);
+    c.appendChild(sparkGrid(D.monthly, 'month', M, slugs, months));
+    c.appendChild(dataTable(['Month', ...slugs.map(nameOf)], months.map(m =>
+      [m, ...slugs.map(s => { const r = D.monthly.find(x => x.key === s && x.month === m); return r ? fmt(r[M]) : '—'; })])));
+    bindTips(c); grid.appendChild(c);
+  }
+
+  /* daily */
+  {
+    const days = [...new Set(D.daily.map(r => r.day))].sort().slice(-state.days);
+    const c = card(`Daily ${M}`, `Last ${state.days} days with activity`, true);
+    c.appendChild(legend(slugs));
+    c.appendChild(lineChart(D.daily.map(r => ({...r, day: r.day.slice(5)})), 'day', M, slugs, days.map(d => d.slice(5)), { allTicks: true, valueLabels: true }));
+    c.appendChild(dataTable(['Day', ...slugs.map(nameOf)], days.map(d =>
+      [d, ...slugs.map(s => { const r = D.daily.find(x => x.key === s && x.day === d); return r ? fmt(r[M]) : '—'; })])));
+    bindTips(c); grid.appendChild(c);
+  }
+
+  /* on-time vs overdue */
+  {
+    const c = card('Checkouts out now — on time vs overdue', 'Grouped by organisation; overdue segment in status red');
+    c.appendChild(hBars(orgGrouped(slugs, s => {
+      const r = D.snapshot[s];
+      const out = Number(r.current_checkouts), od = Number(r.overdue_now);
+      return { label: shortOf(s), parts: [
+        { v: out - od, color: color(s), tip: `<b>${nameOf(s)}</b><br>On time: ${fmt(out - od)}` },
+        { v: od, color: '#d03b3b', tip: `<b>${nameOf(s)}</b><br>⚠ Overdue: ${fmt(od)}` },
+      ]};
+    }, s => Number(D.snapshot[s].current_checkouts)), { labelW: 130 }));
+    const lg = document.createElement('div'); lg.className = 'legend';
+    lg.innerHTML = `<span><i style="background:var(--ink2)"></i>On time (library color)</span>
+                    <span><i style="background:#d03b3b"></i>⚠ Overdue (critical)</span>`;
+    c.appendChild(lg);
+    c.appendChild(dataTable(['Library', 'Out now', 'Overdue', 'Overdue %'], slugs.map(s => {
+      const r = D.snapshot[s];
+      return [nameOf(s), fmt(r.current_checkouts), fmt(r.overdue_now),
+              Math.round(100 * r.overdue_now / Math.max(1, r.current_checkouts)) + '%'];
+    })));
+    bindTips(c); grid.appendChild(c);
+  }
+
+  /* collection size */
+  {
+    const c = card('Collection size by library', 'Grouped by organisation; copies held (titles in tooltip)');
+    c.appendChild(hBars(orgGrouped(slugs, s => {
+      const r = D.snapshot[s];
+      return { label: shortOf(s), parts: [{ v: Number(r.copies), color: color(s),
+        tip: `<b>${nameOf(s)}</b><br>Copies: ${fmt(r.copies)}<br>Titles: ${fmt(r.titles)}` }] };
+    }, s => Number(D.snapshot[s].copies)), { labelW: 130 }));
+    c.appendChild(dataTable(['Library', 'Copies', 'Titles'],
+      slugs.map(s => [nameOf(s), fmt(D.snapshot[s].copies), fmt(D.snapshot[s].titles)])));
+    bindTips(c); grid.appendChild(c);
+  }
+
+  /* new items */
+  {
+    const months = [...new Set(D.newItems.map(r => r.month))].sort().slice(-state.months);
+    const c = card('New items accessioned', `Per month, last ${state.months} months`, true);
+    c.appendChild(legend(slugs));
+    c.appendChild(lineChart(D.newItems, 'month', 'added', slugs, months));
+    c.appendChild(dataTable(['Month', ...slugs.map(nameOf)], months.map(m =>
+      [m, ...slugs.map(s => { const r = D.newItems.find(x => x.key === s && x.month === m); return r ? fmt(r.added) : '—'; })])));
+    bindTips(c); grid.appendChild(c);
+  }
+
+  /* top titles */
+  {
+    const c = card('Most borrowed this month', 'Top 5 per library', true);
+    const wrap = document.createElement('div'); wrap.className = 'lists';
+    slugs.forEach(s => {
+      const items = D.topTitles.filter(r => r.key === s).slice(0, 5);
+      const div = document.createElement('div');
+      div.innerHTML = `<h3><i style="background:${color(s)}"></i>${nameOf(s)}</h3>` +
+        (items.length
+          ? `<ol>${items.map(r => `<li><span class="n">${esc(r.title)}</span>${r.author ? ' — ' + esc(r.author) : ''} (${fmt(r.checkouts)})</li>`).join('')}</ol>`
+          : `<p class="note">No checkouts recorded this month.</p>`);
+      wrap.appendChild(div);
+    });
+    c.appendChild(wrap); grid.appendChild(c);
+  }
+
+  /* by category */
+  {
+    const c = card('Checkouts by patron category', 'This month, top categories per library', true);
+    const wrap = document.createElement('div'); wrap.className = 'lists';
+    slugs.forEach(s => {
+      const items = D.byCategory.filter(r => r.key === s).slice(0, 6);
+      const div = document.createElement('div');
+      div.innerHTML = `<h3><i style="background:${color(s)}"></i>${nameOf(s)}</h3>`;
+      if (items.length) {
+        div.appendChild(hBars(items.map(r => ({ label: r.category, parts: [{ v: Number(r.checkouts),
+          color: color(s), tip: `<b>${esc(r.category)}</b><br>${fmt(r.checkouts)} checkouts` }] })), { labelW: 120 }));
+      } else div.innerHTML += `<p class="note">No checkouts this month.</p>`;
+      wrap.appendChild(div);
+    });
+    c.appendChild(wrap); bindTips(c); grid.appendChild(c);
+  }
+
+  /* collection by item type */
+  {
+    const c = card('Collection by item type', 'Top 6 types per library', true);
+    const wrap = document.createElement('div'); wrap.className = 'lists';
+    slugs.forEach(s => {
+      const items = D.byItype.filter(r => r.key === s).slice(0, 6);
+      const div = document.createElement('div');
+      div.innerHTML = `<h3><i style="background:${color(s)}"></i>${nameOf(s)}</h3>`;
+      if (items.length) {
+        div.appendChild(hBars(items.map(r => ({ label: r.item_type, parts: [{ v: Number(r.copies),
+          color: color(s), tip: `<b>${esc(r.item_type)}</b><br>${fmt(r.copies)} copies` }] })), { labelW: 130 }));
+      }
+      wrap.appendChild(div);
+    });
+    c.appendChild(wrap); bindTips(c); grid.appendChild(c);
+  }
+}
+
+render();
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    main()
