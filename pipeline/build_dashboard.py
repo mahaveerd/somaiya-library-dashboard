@@ -52,9 +52,14 @@ def q(con, sql):
 
 
 def latest(con, table):
-    return q(con, f'''SELECT t.* FROM "{table}" t
-        JOIN (SELECT campus, MAX(fetched_at) mf FROM "{table}" GROUP BY campus) m
-          ON m.campus = t.campus AND m.mf = t.fetched_at''')
+    # a table is absent when every instance returned zero rows for that report
+    # (e.g. "this month" reports in the first hours of a new month) — treat as empty
+    try:
+        return q(con, f'''SELECT t.* FROM "{table}" t
+            JOIN (SELECT campus, MAX(fetched_at) mf FROM "{table}" GROUP BY campus) m
+              ON m.campus = t.campus AND m.mf = t.fetched_at''')
+    except sqlite3.OperationalError:
+        return []
 
 
 def keyed(rows):
