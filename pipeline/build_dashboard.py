@@ -19,6 +19,7 @@ OUT = HERE / "dashboard.html"
 ORGS = {
     "SVU": "Somaiya Vidyavihar University",
     "SVV": "Somaiya Vidyavihar",
+    "SMT": "Somaiya Medical Trust",
 }
 
 # fixed entity registry keyed by "instance:branchcode" — color follows the
@@ -38,6 +39,19 @@ ENTITIES = {
     # — SVV: trust institutions (Mumbai University-affiliated / schools) —
     "kjsit:KJSIT":   ("KJS Institute of Technology", "KJSIT", 2, "SVV"),
     "ded:SSKSJCE":   ("SKS Junior College of Education", "DED", 10, "SVV"),  # live Sep 2026
+    # — went live by Oct 2026 (slots >8 render gray; original 8 keep their hues) —
+    "kjssc:KJSCSAC": ("KJS Science & Commerce", "KJSSC", 11, "SVV"),
+    "kjsac:KJSAC":   ("KJS Arts & Commerce", "KJSAC", 12, "SVV"),
+    "vinaymandir:VMKOHA": ("Vinay Mandir", "VM", 13, "SVV"),
+    "tss:TSS":       ("The Somaiya School", "TSS", 14, "SVV"),
+    "polytech:KJSP": ("KJS Polytechnic", "Poly", 18, "SVV"),
+    "polytechptd:KJSPPTD": ("KJS Polytechnic PT Diploma", "PolyPTD", 19, "SVV"),
+    "polytechua:KJSPNA": ("KJS Polytechnic Non-Aided", "PolyNA", 20, "SVV"),
+    "polytechycmou:YCMOU": ("YCMOU Centre", "YCMOU", 21, "SVV"),
+    # — SMT: Somaiya Medical Trust (one instance, three branch libraries) —
+    "medicaltrust:KJSMC":  ("KJS Medical College", "KJSMC", 15, "SMT"),
+    "medicaltrust:kjscp":  ("KJS Physiotherapy", "Physio", 16, "SMT"),
+    "medicaltrust:kjsscn": ("KJS Nursing", "Nursing", 17, "SMT"),
 }
 SERIES_LIGHT = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#eda100",
                 5: "#e87ba4", 6: "#008300", 7: "#4a3aa7", 8: "#e34948", 9: "#898781"}
@@ -95,7 +109,7 @@ def main():
         "seriesLight": SERIES_LIGHT,
         "seriesDark": SERIES_DARK,
     }
-    page = TEMPLATE.replace("__DATA__", json.dumps(data).replace("</", "<\\/"))
+    page = TEMPLATE.replace("__DATA__", json.dumps(data).replace("</", "<\\/")).replace("__DATA_SRC__", "null")
     OUT.write_text(page)
 
     # artifact variant: same page without the outer skeleton (artifact wraps it)
@@ -112,7 +126,8 @@ def main():
     site = Path(os.environ.get("SITE_DIR", HERE / "site"))
     site.mkdir(exist_ok=True)
     pages_html = TEMPLATE.replace("<script>", '<script type="module">', 1).replace(
-        "__DATA__", "await (await fetch('data.json?v=' + Date.now())).json()")
+        "__DATA__", "await (await fetch('data.json?v=' + Date.now())).json()").replace(
+        "__DATA_SRC__", "'data.json'")
     (site / "index.html").write_text(pages_html)
     (site / "data.json").write_text(json.dumps(data))
     print(f"built {OUT} (+ artifact & site variants) — {len(present)} libraries, harvest {fetched}")
@@ -156,8 +171,10 @@ TEMPLATE = r"""<!DOCTYPE html>
            display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
   header h1 { margin: 0; font-size: 20px; font-weight: 700; }
   header .sub { color: #f3d2d5; font-size: 12.5px; margin-top: 3px; }
-  #themeBtn { background: rgba(255,255,255,.14); color: #fff; border: 1px solid rgba(255,255,255,.35);
-              border-radius: 8px; padding: 6px 12px; font-size: 12.5px; cursor: pointer; }
+  .hdrbtn { background: rgba(255,255,255,.14); color: #fff; border: 1px solid rgba(255,255,255,.35);
+            border-radius: 8px; padding: 6px 12px; font-size: 12.5px; cursor: pointer;
+            text-decoration: none; display: inline-block; font-family: inherit; }
+  .hdrbtn[disabled] { opacity: .5; cursor: wait; }
   main { max-width: 1180px; margin: 0 auto; padding: 18px 20px 60px; }
   .controls { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center;
               background: var(--surface); border: 1px solid var(--ring); border-radius: 10px;
@@ -235,7 +252,15 @@ TEMPLATE = r"""<!DOCTYPE html>
     <h1>Somaiya Libraries — KPI Dashboard</h1>
     <div class="sub" id="subtitle"></div>
   </div>
-  <button id="themeBtn">◐ Theme: Auto</button>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <span id="hdrActions" style="display:none">
+      <button id="reloadBtn" class="hdrbtn" title="Re-fetch the latest harvested data">⟳ Reload data</button>
+      <a id="harvestLink" class="hdrbtn" target="_blank" rel="noopener"
+         href="https://github.com/mahaveerd/somaiya-library-dashboard/actions/workflows/refresh.yml"
+         title="Trigger a fresh harvest from all Koha servers (needs a GitHub login; takes ~2 min, then press Reload)">⚡ Harvest now ↗</a>
+    </span>
+    <button id="themeBtn" class="hdrbtn">◐ Theme: Auto</button>
+  </div>
 </header>
 <main>
   <div class="controls" id="controls"></div>
@@ -245,8 +270,9 @@ TEMPLATE = r"""<!DOCTYPE html>
 <div id="tip"></div>
 <footer id="foot"></footer>
 <script>
-const D = __DATA__;
-const ALL = D.entities.map(c => c.key);
+let D = __DATA__;
+const DATA_SRC = __DATA_SRC__;
+let ALL = D.entities.map(c => c.key);
 const state = { sel: new Set(ALL), metric: 'checkouts', months: 13, days: 30, theme: 'auto' };
 
 const isDark = () => {
@@ -264,10 +290,32 @@ const fmt = n => Number(n).toLocaleString('en-IN');
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const sel = () => ALL.filter(s => state.sel.has(s));
 
-document.getElementById('subtitle').textContent =
-  `${ALL.length} libraries live on Koha · data harvested ${D.fetched.replace('T',' ').replace('+00:00',' UTC')}`;
-document.getElementById('foot').textContent =
-  `Generated ${D.generated} · aggregates only, no patron-level data · member counts are branch-registered; the shared "Global" pool (~37k campus-wide accounts) is excluded · more libraries appear as they go live`;
+function updateChrome() {
+  const ageMin = Math.max(0, Math.round((Date.now() - Date.parse(D.fetched)) / 60000));
+  const age = ageMin < 60 ? `${ageMin} min ago` : `${Math.round(ageMin / 60)} h ago`;
+  document.getElementById('subtitle').textContent =
+    `${ALL.length} libraries live on Koha · data harvested ${D.fetched.replace('T',' ').replace('+00:00',' UTC')} (${age})`;
+  document.getElementById('foot').textContent =
+    `Generated ${D.generated} · aggregates only, no patron-level data · member counts are branch-registered; the shared "Global" pool of campus-wide accounts is excluded · more libraries appear as they go live`;
+}
+
+/* ---------- reload / harvest controls (hosted variant only) ---------- */
+if (DATA_SRC) {
+  document.getElementById('hdrActions').style.display = 'inline';
+  const rb = document.getElementById('reloadBtn');
+  rb.onclick = async () => {
+    rb.disabled = true; rb.textContent = '⟳ Loading…';
+    try {
+      D = await (await fetch(DATA_SRC + '?v=' + Date.now())).json();
+      ALL = D.entities.map(c => c.key);
+      ALL.forEach(k => { if (![...state.sel].some(x => ALL.includes(x))) state.sel = new Set(ALL); });
+      state.sel = new Set([...state.sel].filter(k => ALL.includes(k)));
+      if (!state.sel.size) state.sel = new Set(ALL);
+      render();
+    } catch (e) { alert('Could not reload data: ' + e.message); }
+    rb.disabled = false; rb.textContent = '⟳ Reload data';
+  };
+}
 
 /* ---------- theme toggle ---------- */
 const themeBtn = document.getElementById('themeBtn');
@@ -588,6 +636,7 @@ function sparkGrid(rows, xKey, yKey, slugs, xLabels) {
 /* ---------- render ---------- */
 function render() {
   refreshSer();
+  updateChrome();
   buildControls();
   const slugs = sel();
   const M = state.metric;
@@ -648,12 +697,11 @@ function render() {
     bindTips(c); grid.appendChild(c);
   }
 
-  /* daily */
+  /* daily — small multiples, one panel per library */
   {
     const days = [...new Set(D.daily.map(r => r.day))].sort().slice(-state.days);
-    const c = card(`Daily ${M}`, `Last ${state.days} days with activity`, true);
-    c.appendChild(legend(slugs));
-    c.appendChild(lineChart(D.daily.map(r => ({...r, day: r.day.slice(5)})), 'day', M, slugs, days.map(d => d.slice(5)), { allTicks: true, valueLabels: true }));
+    const c = card(`Daily ${M}`, `Last ${state.days} days with activity — latest day, change vs previous, and trend per library`, true);
+    c.appendChild(sparkGrid(D.daily.map(r => ({...r, day: r.day.slice(5)})), 'day', M, slugs, days.map(d => d.slice(5))));
     c.appendChild(dataTable(['Day', ...slugs.map(nameOf)], days.map(d =>
       [d, ...slugs.map(s => { const r = D.daily.find(x => x.key === s && x.day === d); return r ? fmt(r[M]) : '—'; })])));
     bindTips(c); grid.appendChild(c);
