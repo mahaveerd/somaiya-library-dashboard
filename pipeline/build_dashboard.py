@@ -52,6 +52,14 @@ ENTITIES = {
     "medicaltrust:KJSMC":  ("KJS Medical College", "KJSMC", 15, "SMT"),
     "medicaltrust:kjscp":  ("KJS Physiotherapy", "Physio", 16, "SMT"),
     "medicaltrust:kjsscn": ("KJS Nursing", "Nursing", 17, "SMT"),
+    # — school libraries, live by Oct 2026 —
+    "kjsems:KJSEMSS":   ("KJS English Medium Sameerwadi", "KJSEMS", 22, "SVV"),
+    "kopargaon:SSEMS":  ("Sharda English Medium Kopargaon", "SSEMS", 23, "SVV"),
+    "sakarwadi:SVMS":   ("Vidya Mandir Sakarwadi", "SVMS", 24, "SVV"),
+    "laxmiwadi:SVML":   ("Vidya Mandir Laxmiwadi", "SVML", 25, "SVV"),
+    "vti:KJSVTI":       ("KJS Vocational Training Institute", "VTI", 26, "SVV"),
+    "nareshwadi:NLC":   ("Nareshwadi Learning Centre", "NLC", 27, "SVV"),
+    "sameerwadi:SKMSLS": ("Kannada Medium Sameerwadi", "SKMSLS", 28, "SVV"),  # appears once MBD access lands
 }
 SERIES_LIGHT = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", 4: "#eda100",
                 5: "#e87ba4", 6: "#008300", 7: "#4a3aa7", 8: "#e34948", 9: "#898781"}
