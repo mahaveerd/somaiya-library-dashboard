@@ -3,7 +3,7 @@ name: Refresh dashboard data
 on:
   workflow_dispatch:      # "Run workflow" button — team can refresh on demand
   schedule:
-    - cron: '15 3-13 * * *'   # hourly 08:45–18:45 IST
+    - cron: '37 3-13 * * *'   # hourly 09:07-19:07 IST (odd minute - GitHub skips busy :00/:15/:30/:45 slots)
 
 permissions:
   contents: write
